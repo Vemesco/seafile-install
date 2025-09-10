@@ -28,7 +28,7 @@ sudo apt-get update
 sudo apt-get install -y python3 python3-pip python3-venv python3-dev python3-setuptools python3.12-venv  sqlite3 \
   libmysqlclient-dev default-libmysqlclient-dev ldap-utils libldap2-dev libsasl2-dev libssl-dev memcached \
   libmemcached-dev build-essential libffi-dev pwgen pkg-config
-sudo systemctl enable --now memcached
+#sudo systemctl enable --now memcached
 
 # ----- Seafile User & Directory -----
 sudo adduser --system --group $SEAFILE_USER
@@ -104,7 +104,18 @@ export SERVER_NAME="$HOSTNAME"
 export SERVER_IP="$SERVER_IP"
 export FILESERVER_PORT="$FILESERVER_PORT"
 cd $SEAFILE_DIR/seafile-server-${SEAFILE_VERSION}
-./setup-seafile.sh auto
+./setup-seafile-mysql.sh auto <<EOF
+$HOSTNAME
+$SERVER_IP
+$FILESERVER_PORT
+$DB_HOST
+$DB_PORT
+$DB_USER
+$DB_PASS
+$DB1
+$DB2
+$DB3
+EOF
 "
 echo "Seafile setup completed."
 #Seafile configuration files
@@ -157,15 +168,15 @@ EOT
 sudo chown $SEAFILE_USER:$SEAFILE_USER $SEAFILE_DIR/conf/.env
 sudo chmod 664 $SEAFILE_DIR/conf/.env
 
-#Update Seahub settings for memcached
-cat <<EOF | sudo tee -a $SEAFILE_DIR/conf/seahub_settings.py
-CACHES = {
-    'default': {
-        'BACKEND': 'django_pylibmc.memcached.PyLibMCCache',
-        'LOCATION': '127.0.0.1:11211',
-    },
-}
-EOF
+##Update Seahub settings for memcached
+#cat <<EOF | sudo tee -a $SEAFILE_DIR/conf/seahub_settings.py
+#CACHES = {
+#    'default': {
+#        'BACKEND': 'django_pylibmc.memcached.PyLibMCCache',
+#        'LOCATION': '127.0.0.1:11211',
+#    },
+#}
+#EOF
 
 # ----- Python Virtual Environment Setup -----
 sudo -u $SEAFILE_USER bash -c "
@@ -183,11 +194,90 @@ echo "Admin email: $ADMIN_EMAIL"
 echo "Admin pass: $ADMIN_PASS"
 echo "Edit variables in the script as needed before running in production."
 
+ # Create run_with_venv.sh script
+cat > "$SEAFILE_DIR/run_with_venv.sh" <<EOF
+#!/bin/bash
+# Activate the python virtual environment (venv) before starting one of the seafile scripts
+
+dir_name="/opt/seafile"
+venv_path="${dir_name}/python-venv/bin/activate"
+
+# Check if venv exists
+if [ ! -f "$venv_path" ]; then
+  echo "Error: Virtual environment not found at $venv_path"
+  exit 1
+fi
+
+script="$1"
+shift 1
+
+# Check if script argument provided
+if [ -z "$script" ]; then
+  echo "Usage: $0 <script_name> [arguments...]"
+  exit 1
+fi
+
+# Execute the script with the virtual environment activated
+bash -c "
+source '${venv_path}' && \
+echo 'Virtual environment activated' && \
+echo 'Running: ${dir_name}/seafile-server-latest/${script} $*' && \
+export \\$(cat ${dir_name}/conf/.env | xargs) && \
+'${dir_name}/seafile-server-latest/${script}' $*
+" -- "$@"
+EOF
+chmod +x "$SEAFILE_DIR/run_with_venv.sh"
+
 # ----- Seafile and Seahub Start----- need to automate the admin user creation when starting seahub
 sudo -u $SEAFILE_USER bash -c "
-cd $SEAFILE_DIR/seafile-server-${SEAFILE_VERSION}
-export $(cat /opt/seafile/conf/.env | xargs)
-./seafile.sh start
-./seahub.sh start
+$SEAFILE_DIR/run_with_venv.sh seafile.sh start
+$SEAFILE_DIR/run_with_venv.sh seahub.sh start
 "
+# ----- Create systemd service files for Seafile and Seahub -----
+SEAFILE_SERVICE_FILE="/etc/systemd/system/seafile.service"
+SEAHUB_SERVICE_FILE="/etc/systemd/system/seahub.service"
+
+sudo tee $SEAFILE_SERVICE_FILE > /dev/null <<EOF
+[Unit]
+Description=Seafile
+After=network.target mysql.service
+Requires=mysql.service
+
+[Service]
+Type=forking
+User=$SEAFILE_USER
+Group=$SEAFILE_USER
+ExecStart=$SEAFILE_DIR/run_with_venv.sh seafile.sh start
+ExecStop=$SEAFILE_DIR/run_with_venv.sh seafile.sh stop
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo tee $SEAHUB_SERVICE_FILE > /dev/null <<EOF
+[Unit]
+Description=Seafile Seahub
+After=seafile.service
+Requires=seafile.service
+
+[Service]
+Type=forking
+User=$SEAFILE_USER
+Group=$SEAFILE_USER
+ExecStart=$SEAFILE_DIR/run_with_venv.sh seahub.sh start
+ExecStop=$SEAFILE_DIR/run_with_venv.sh seahub.sh stop
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable seafile.service
+sudo systemctl enable seahub.service
+sudo systemctl start seafile.service
+sudo systemctl start seahub.service
 echo "Seafile and Seahub services started."
